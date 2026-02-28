@@ -130,3 +130,26 @@ class TransactionEventRequest(BaseModel):
     idToken: IdTokenType | None = None
     evse: OcppEvseType | None = None
     meterValue: list[MeterValueType] | None = None
+
+
+class Ocpp16StartTransactionRequest(BaseModel):
+    connectorId: int
+    idTag: str
+    meterStart: int
+    timestamp: datetime
+    reservationId: int | None = None
+
+
+class Ocpp16StopTransactionRequest(BaseModel):
+    transactionId: int
+    idTag: str | None = None
+    timestamp: datetime
+    meterStop: int
+    reason: str | None = None
+    transactionData: list[MeterValueType] | None = None
+
+
+class Ocpp16StartTransactionResponse(BaseModel):
+    """OCPP 1.6 StartTransaction.conf — sent by the charger back to the CSMS."""
+    transactionId: int
+    idTagInfo: dict  # Contains status (Accepted/Invalid/etc.)

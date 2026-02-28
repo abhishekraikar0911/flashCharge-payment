@@ -41,7 +41,9 @@ def create_checkout(request_body: CheckoutCreate, db: Session = Depends(get_db))
     db.commit()
     db.refresh(db_checkout)
 
-    checkout = stripe.checkout.Session.create(
+    # Build checkout params - only use stripe_account for real Connect accounts
+    stripe_account_id = location.operator.stripe_account_id
+    checkout_params = dict(
         payment_method_types=["card"],
         line_items=[
             {
@@ -58,11 +60,15 @@ def create_checkout(request_body: CheckoutCreate, db: Session = Depends(get_db))
         payment_intent_data={
             "capture_method": "manual",
         },
-        stripe_account=location.operator.stripe_account_id,
         mode="payment",
         success_url=f"{request_body.success_url}/{db_checkout.id}",
         cancel_url=request_body.cancel_url,
     )
+    # Only attach stripe_account for real Connect accounts (not test placeholders)
+    if stripe_account_id and stripe_account_id != "acct_test_123":
+        checkout_params["stripe_account"] = stripe_account_id
+
+    checkout = stripe.checkout.Session.create(**checkout_params)
     db_checkout.payment_intent_id = checkout.payment_intent
     db.add(db_checkout)
     db.commit()

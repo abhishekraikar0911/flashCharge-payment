@@ -131,6 +131,16 @@ class Checkout(Base):
     remote_request_transaction_id = Column(
         String(36),
     )
+    # Correlation ID from the AMQP message headers — links StartTransaction request → response
+    correlation_id = Column(
+        String(255),
+        index=True,
+    )
+    # The transaction ID assigned by the charger (from StartTransaction response)
+    transaction_id = Column(
+        String(255),
+        index=True,
+    )
 
     transaction_start_time = Column(
         DateTime(timezone=True),
@@ -149,6 +159,9 @@ class Checkout(Base):
     )
     transaction_soc = Column(
         Float,
+    )
+    ocpp_protocol = Column(
+        String(10),
     )
 
 

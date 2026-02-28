@@ -31,19 +31,24 @@ class OcppIntegration:
 
         db_operator: Operator = (
             db.query(Operator)
+            .join(Location)
+            .join(Evse)
+            .join(Connector)
             .filter(
                 Connector.id == db_checkout.connector_id,
-            )
-            .filter(
-                Evse.id == Connector.evse_id,
-            )
-            .filter(
-                Location.id == Evse.location_id,
             )
             .first()
         )
 
         pricing = generate_pricing(checkout_id=checkout_id)
+        
+        if db_checkout.transaction_kwh is None:
+            error(f" [integrations] CAPTURE BLOCKED - transaction_kwh missing for Checkout: {db_checkout.id}")
+            return
+
+        if not db_checkout.payment_intent_id:
+            error(f" [integrations] CAPTURE BLOCKED - payment_intent_id missing for Checkout: {db_checkout.id}")
+            return
 
         suc_intent = stripe.PaymentIntent.capture(
             intent=db_checkout.payment_intent_id,

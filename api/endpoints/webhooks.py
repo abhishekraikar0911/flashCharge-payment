@@ -1,10 +1,13 @@
 import json
+import time
+from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 import stripe
 from fastapi import APIRouter, Depends, HTTPException, Header, Request
-from logging import debug, exception
+from logging import debug, exception, info, warning
 from json import loads
 from sqlalchemy.orm import Session
+from sqlalchemy import create_engine, text
 
 from config import Config
 from db.init_db import Connector, Evse, Transaction, get_db, Checkout as CheckoutModel
@@ -79,6 +82,17 @@ async def stripe_webhook(
             raise HTTPException(
                 status_code=404, detail="No checkout found for payment intent"
             )
+
+        # --- FIX 1: Idempotency guard ---
+        # Stripe may send the same webhook event multiple times (retries).
+        # If this checkout was already successfully started, skip it silently.
+        if db_checkout.remote_request_status == RequestStartStopStatusEnumType.ACCEPTED:
+            info(
+                " [Webhook] Duplicate event ignored — checkout %r already Accepted.",
+                checkoutId,
+            )
+            return {}
+
         db_checkout.authorization_amount = checkout_session.get("amount_total")
 
         if paymentIntentId and checkoutId and not transactionId:
@@ -124,7 +138,13 @@ async def handle_web_portal(
         )
 
     idToken = authorization["idToken"]
-    request_body = {"remoteStartId": db_checkout.id, "idToken": idToken}
+    # OCPP 2.0.1 format (idToken object) + OCPP 1.6 format (idTag string)
+    request_body = {
+        "remoteStartId": db_checkout.id,
+        "idToken": idToken,
+        # OCPP 1.6 field: flat string idTag
+        "idTag": idToken["idToken"],
+    }
 
     db_connector = (
         db.query(Connector).filter(Connector.id == db_checkout.connector_id).first()
@@ -143,14 +163,15 @@ async def handle_web_portal(
         )
         return RequestStartStopStatusEnumType.REJECTED
 
+    # OCPP 1.6 uses connectorId (integer), OCPP 2.0.1 uses evseId
+    request_body["connectorId"] = db_evse.ocpp_evse_id
     request_body["evseId"] = db_evse.ocpp_evse_id
 
     debug(" [Stripe] remote start request: %r", json.dumps(request_body))
 
-    citrineos_module = (
-        "evdriver"  # TODO set up programatic way to resolve module from action
-    )
-    action = "requestStartTransaction"
+    # Use OCPP 1.6 endpoint (not 2.0.1 requestStartTransaction)
+    citrineos_module = "1.6/evdriver"
+    action = "remoteStartTransaction"
     response = ocpp_integration.send_citrineos_message(
         station_id=db_evse.station_id,
         tenant_id=db_evse.tenant_id,
@@ -159,7 +180,15 @@ async def handle_web_portal(
     )
     remote_start_stop = RequestStartStopStatusEnumType.REJECTED
     if response.status_code == 200:
-        if response.json().get("success"):
+        # Core returns [{"success": true}] (list) — handle both list and dict
+        resp_json = response.json()
+        if isinstance(resp_json, list) and len(resp_json) > 0:
+            success = resp_json[0].get("success")
+        elif isinstance(resp_json, dict):
+            success = resp_json.get("success")
+        else:
+            success = False
+        if success:
             remote_start_stop = RequestStartStopStatusEnumType.ACCEPTED
     db_checkout.remote_request_status = remote_start_stop
 
@@ -171,6 +200,58 @@ async def handle_web_portal(
         db_checkout.id,
         db_checkout.remote_request_status,
     )
+
+    # --- FIX 2: Poll CitrineOS Transactions table for the new transaction ID ---
+    # RabbitMQ state=2 events are unreliable for capturing the transactionId.
+    # Instead, query the CitrineOS DB directly right after remote start succeeds.
+    if remote_start_stop == RequestStartStopStatusEnumType.ACCEPTED:
+        try:
+            core_engine = create_engine(
+                f"postgresql://{Config.DB_USER}:{Config.DB_PASSWORD}"
+                f"@{Config.DB_HOST}:{Config.DB_PORT}/{Config.DB_DATABASE}"
+            )
+            # Give the charger up to 10 seconds to respond with StartTransaction
+            for attempt in range(5):
+                time.sleep(2)
+                with core_engine.connect() as conn:
+                    result = conn.execute(
+                        text(
+                            """
+                            SELECT "transactionId", "startTime"
+                            FROM "Transactions"
+                            WHERE "stationId" = :station_id
+                              AND "isActive" = true
+                              AND "startTime" >= NOW() - INTERVAL '60 seconds'
+                            ORDER BY "startTime" DESC
+                            LIMIT 1
+                            """
+                        ),
+                        {"station_id": db_evse.station_id},
+                    ).fetchone()
+                    if result:
+                        db_checkout.transaction_id = str(result[0])
+                        db_checkout.transaction_start_time = result[1]
+                        db.add(db_checkout)
+                        db.commit()
+                        info(
+                            " [Webhook] Linked transactionId=%r to checkout_id=%r",
+                            result[0],
+                            db_checkout.id,
+                        )
+                        break
+                    else:
+                        debug(
+                            " [Webhook] Attempt %r: no active transaction found yet for station %r, retrying...",
+                            attempt + 1,
+                            db_evse.station_id,
+                        )
+            else:
+                warning(
+                    " [Webhook] Could not find active transaction for station %r after remote start.",
+                    db_evse.station_id,
+                )
+        except Exception as e:
+            exception(" [Webhook] Error while polling for transactionId: %r", e)
 
 
 async def handle_scan_and_charge(
@@ -201,7 +282,7 @@ async def handle_scan_and_charge(
         raise HTTPException(status_code=404, detail="Transaction is not active")
 
     authorization = await ocpp_integration.create_authorization(
-        str(uuid4()),
+        f"{Config.OCPP_REMOTESTART_IDTAG_PREFIX}{db_checkout.id}",
         "Central",
         [
             (transactionId, "TransactionId"),
@@ -216,7 +297,11 @@ async def handle_scan_and_charge(
         )
 
     idToken = authorization["idToken"]
-    request_body = {"remoteStartId": db_checkout.id, "idToken": idToken}
+    request_body = {
+        "remoteStartId": db_checkout.id,
+        "idToken": idToken,
+        "idTag": idToken["idToken"],
+    }
 
     if ocppTransaction.evse is not None:
         request_body["evseId"] = ocppTransaction.evse.id
@@ -224,10 +309,9 @@ async def handle_scan_and_charge(
     debug(" [Stripe] remote start request: %r", json.dumps(request_body))
 
     db_evse = db.query(Evse).filter(Evse.station_id == stationId).first()
-    citrineos_module = (
-        "evdriver"  # TODO set up programatic way to resolve module from action
-    )
-    action = "requestStartTransaction"
+    # Use OCPP 1.6 endpoint (not 2.0.1 requestStartTransaction)
+    citrineos_module = "1.6/evdriver"
+    action = "remoteStartTransaction"
     response = ocpp_integration.send_citrineos_message(
         station_id=stationId,
         tenant_id=db_evse.tenant_id,
@@ -236,7 +320,15 @@ async def handle_scan_and_charge(
     )
     remote_start_stop = RequestStartStopStatusEnumType.REJECTED
     if response.status_code == 200:
-        if response.json().get("success"):
+        # Core returns [{"success": true}] (list) — handle both list and dict
+        resp_json = response.json()
+        if isinstance(resp_json, list) and len(resp_json) > 0:
+            success = resp_json[0].get("success")
+        elif isinstance(resp_json, dict):
+            success = resp_json.get("success")
+        else:
+            success = False
+        if success:
             remote_start_stop = RequestStartStopStatusEnumType.ACCEPTED
     db_checkout.remote_request_status = remote_start_stop
     db_checkout.payment_intent_id = paymentIntentId

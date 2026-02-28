@@ -30,17 +30,27 @@ from schemas.transaction_event import (
     TransactionEventEnumType,
     TriggerReasonEnumType,
     TransactionEventRequest,
+    Ocpp16StartTransactionRequest,
+    Ocpp16StartTransactionResponse,
+    Ocpp16StopTransactionRequest,
 )
 
 
 class CitrineOsEventAction(str, Enum):
     TRANSACTIONEVENT = "TransactionEvent"
     STATUSNOTIFICATION = "StatusNotification"
+    STARTTRANSACTION = "StartTransaction"
+    STOPTRANSACTION = "StopTransaction"
 
 
 class CitrineOSevent(BaseModel):
     action: CitrineOsEventAction
     payload: dict
+
+
+class CitrineOSeventState:
+    REQUEST = "1"
+    RESPONSE = "2"
 
 
 class CitrineOSeventHeaders(BaseModel):
@@ -58,7 +68,7 @@ class CitrineOSIntegration(OcppIntegration):
         additionalInfo: List[Tuple[str, str]],
         app: FastAPI = None,
     ):
-        idToken = {
+        idToken_obj = {
             "idToken": idToken,
             "type": idTokenType,
             "additionalInfo": [
@@ -67,7 +77,7 @@ class CitrineOSIntegration(OcppIntegration):
             ],
         }
         request_body = {
-            "idToken": idToken,
+            "idToken": idToken_obj,
             "idTokenInfo": {
                 "status": "Accepted",
             },
@@ -77,26 +87,74 @@ class CitrineOSIntegration(OcppIntegration):
         url_path = f"{module}/{data}"
         request_url = (
             f"{Config.CITRINEOS_DATA_API_URL}/{url_path}"
-            f"?idToken={idToken['idToken']}"
-            f"&type={idToken['type']}"
+            f"?idToken={idToken_obj['idToken']}"
+            f"&type={idToken_obj['type']}"
         )
 
         response = requests.put(request_url, json=request_body)
         if response.status_code == 200:
             return request_body
-        exception(" [CitrineOS] Error while creating authorization: %r", response)
-        return
+
+        # Fallback: REST endpoint not available in this CitrineOS version.
+        # Insert authorization directly into the CitrineOS Core database.
+        info(
+            " [CitrineOS] REST authorization endpoint returned %r, falling back to direct DB insert.",
+            response.status_code,
+        )
+        import json as _json
+        from sqlalchemy import create_engine, text
+        from config import Config as _Config
+
+        try:
+            core_engine = create_engine(
+                f"postgresql://{_Config.DB_USER}:{_Config.DB_PASSWORD}"
+                f"@{_Config.DB_HOST}:{_Config.DB_PORT}/{_Config.DB_DATABASE}"
+            )
+            additional_info_json = _json.dumps(
+                [{"additionalIdToken": item[0], "type": item[1]} for item in additionalInfo]
+            )
+            with core_engine.connect() as conn:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO "Authorizations"
+                            ("idToken", "idTokenType", "additionalInfo", "status", "tenantId",
+                             "createdAt", "updatedAt")
+                        VALUES
+                            (:idToken, :idTokenType, CAST(:additionalInfo AS jsonb), 'Accepted', 1,
+                             NOW(), NOW())
+                        ON CONFLICT ("idToken", "idTokenType")
+                        DO UPDATE SET "status" = 'Accepted', "updatedAt" = NOW(),
+                            "additionalInfo" = CAST(:additionalInfo AS jsonb)
+                        """
+                    ),
+                    {
+                        "idToken": idToken_obj["idToken"],
+                        "idTokenType": idTokenType,
+                        "additionalInfo": additional_info_json,
+                    },
+                )
+                conn.commit()
+            info(" [CitrineOS] Authorization inserted directly into DB for idToken: %r", idToken)
+            return request_body
+        except Exception as e:
+            exception(" [CitrineOS] DB fallback for authorization also failed: %r", e)
+            return
 
     def send_citrineos_message(
         self, station_id: str, tenant_id: str, url_path: str, json_payload: str
     ) -> requests.Response:
+        base_url = Config.CITRINEOS_MESSAGE_API_URL.rstrip("/")
         request_url = (
-            f"{Config.CITRINEOS_MESSAGE_API_URL}/{url_path}"
+            f"{base_url}/{url_path}"
             f"?identifier={station_id}"
             f"&tenantId={tenant_id}"
         )
+        info(" [CitrineOS] Sending message to: %r", request_url)
+        response = requests.post(request_url, json=json_payload)
+        info(" [CitrineOS] Response: %r %r", response.status_code, response.text[:200])
+        return response
 
-        return requests.post(request_url, json=json_payload)
 
     async def receive_events(self, app: FastAPI = None) -> None:
         # Perform connection
@@ -130,6 +188,22 @@ class CitrineOSIntegration(OcppIntegration):
             },
             {
                 "action": "StatusNotification",
+                "state": "1",
+                "x-match": "all",
+            },
+            {
+                "action": "StartTransaction",
+                "state": "1",
+                "x-match": "all",
+            },
+            {
+                # Subscribe to StartTransaction RESPONSES (state=2) to capture transactionId
+                "action": "StartTransaction",
+                "state": "2",
+                "x-match": "all",
+            },
+            {
+                "action": "StopTransaction",
                 "state": "1",
                 "x-match": "all",
             },
@@ -170,6 +244,7 @@ class CitrineOSIntegration(OcppIntegration):
         try:
             decoded_body = event_message.body.decode()
             citrine_os_event = CitrineOSevent(**json.loads(decoded_body))
+            db: Session = next(get_db())
 
             if citrine_os_event.action == CitrineOsEventAction.TRANSACTIONEVENT:
                 citrine_os_event_headers = CitrineOSeventHeaders(
@@ -182,17 +257,55 @@ class CitrineOSIntegration(OcppIntegration):
                     == TriggerReasonEnumType.RemoteStart
                 ):
                     await self.process_transaction_started(
+                        db=db,
                         transaction_event=transaction_event,
                         citrine_os_event_headers=citrine_os_event_headers,
                     )
                 elif transaction_event.eventType == TransactionEventEnumType.Updated:
                     await self.process_transaction_updated(
+                        db=db,
                         transaction_event=transaction_event,
                     )
                 elif transaction_event.eventType == TransactionEventEnumType.Ended:
                     await self.process_transaction_ended(
+                        db=db,
                         transaction_event=transaction_event,
                     )
+                return
+            elif citrine_os_event.action == CitrineOsEventAction.STARTTRANSACTION:
+                citrine_os_event_headers = CitrineOSeventHeaders(
+                    **event_message.headers
+                )
+                state = event_message.headers.get("state", CitrineOSeventState.REQUEST)
+                if state == CitrineOSeventState.RESPONSE:
+                    # StartTransaction RESPONSE from charger — capture transactionId
+                    start_transaction_response = Ocpp16StartTransactionResponse(**citrine_os_event.payload)
+                    await self.process_ocpp16_start_transaction_response(
+                        db=db,
+                        start_transaction_response=start_transaction_response,
+                        citrine_os_event_headers=citrine_os_event_headers,
+                        correlation_id=event_message.headers.get("correlationId"),
+                    )
+                else:
+                    # StartTransaction REQUEST from charger to CSMS — store correlation_id
+                    start_transaction = Ocpp16StartTransactionRequest(**citrine_os_event.payload)
+                    await self.process_ocpp16_start_transaction(
+                        db=db,
+                        start_transaction=start_transaction,
+                        citrine_os_event_headers=citrine_os_event_headers,
+                        correlation_id=event_message.headers.get("correlationId"),
+                    )
+                return
+            elif citrine_os_event.action == CitrineOsEventAction.STOPTRANSACTION:
+                citrine_os_event_headers = CitrineOSeventHeaders(
+                    **event_message.headers
+                )
+                stop_transaction = Ocpp16StopTransactionRequest(**citrine_os_event.payload)
+                await self.process_ocpp16_stop_transaction(
+                    db=db,
+                    stop_transaction=stop_transaction,
+                    citrine_os_event_headers=citrine_os_event_headers,
+                )
                 return
             elif citrine_os_event.action == CitrineOsEventAction.STATUSNOTIFICATION:
                 citrine_os_event_headers = CitrineOSeventHeaders(
@@ -202,6 +315,7 @@ class CitrineOSIntegration(OcppIntegration):
                     **citrine_os_event.payload
                 )
                 await self.process_status_notification(
+                    db=db,
                     status_notification=status_notification,
                     citrine_os_event_headers=citrine_os_event_headers,
                 )
@@ -222,8 +336,69 @@ class CitrineOSIntegration(OcppIntegration):
             exception(" [CitrineOS] Processing error for incoming event: %r", e.__str__)
             raise e
 
+    async def _get_checkout_by_event(
+        self,
+        db: Session,
+        id_tag: str | None = None,
+        remote_start_id: int | None = None,
+        transaction_id: int | None = None,
+        station_id: str | None = None,
+        protocol: str = "unknown",
+    ) -> CheckoutModel | None:
+        checkout_id = None
+
+        if remote_start_id:
+            checkout_id = remote_start_id
+        elif id_tag and id_tag.startswith(Config.OCPP_REMOTESTART_IDTAG_PREFIX):
+            try:
+                # Strictly parse checkout_id from prefix
+                checkout_id_str = id_tag[len(Config.OCPP_REMOTESTART_IDTAG_PREFIX) :]
+                checkout_id = int(checkout_id_str)
+            except (ValueError, IndexError):
+                warning(f" [CitrineOS] Could not extract checkout ID from idTag: {id_tag}")
+
+        # Fallback for OCPP 1.6 StopTransaction which might not have idTag
+        if checkout_id is None and transaction_id is not None and protocol == "ocpp1.6":
+            info(f" [CitrineOS] Attempting fallback correlation for transactionId={transaction_id}")
+            from sqlalchemy import create_engine, text
+            try:
+                core_engine = create_engine(
+                    f"postgresql://{Config.DB_USER}:{Config.DB_PASSWORD}@{Config.DB_HOST}:{Config.DB_PORT}/{Config.DB_DATABASE}"
+                )
+                with core_engine.connect() as conn:
+                    result = conn.execute(
+                        text(
+                            """
+                            SELECT a."idToken" 
+                            FROM "Transactions" t
+                            JOIN "Authorizations" a ON t."authorizationId" = a.id
+                            WHERE t."transactionId" = :tx_id AND t."stationId" = :station_id
+                            """
+                        ),
+                        {"tx_id": str(transaction_id), "station_id": station_id},
+                    ).fetchone()
+                    if result and result[0].startswith(Config.OCPP_REMOTESTART_IDTAG_PREFIX):
+                        id_tag = result[0]
+                        checkout_id_str = id_tag[len(Config.OCPP_REMOTESTART_IDTAG_PREFIX) :]
+                        checkout_id = int(checkout_id_str)
+                        info(f" [CitrineOS] Fallback success: transactionId={transaction_id} -> idTag={id_tag} -> checkout_id={checkout_id}")
+            except Exception as e:
+                warning(f" [CitrineOS] Fallback correlation failed: {e}")
+
+        if checkout_id:
+            db_checkout = db.query(CheckoutModel).filter(CheckoutModel.id == checkout_id).first()
+            if db_checkout:
+                info(
+                    f" [Billing Correlation] Protocol={protocol} idTag={id_tag} -> checkout_id={checkout_id}"
+                )
+                return db_checkout
+
+        warning(f" [CitrineOS] Checkout not found for event (idTag={id_tag}, remoteStartId={remote_start_id})")
+        return None
+
     async def process_transaction_started(
         self,
+        db: Session,
         transaction_event: TransactionEventRequest,
         citrine_os_event_headers: CitrineOSeventHeaders,
     ) -> None:
@@ -238,23 +413,25 @@ class CitrineOSIntegration(OcppIntegration):
             and transaction_event.idToken is None
         ):
             await self.process_transaction_started_scan_and_charge(
+                db=db,
                 transaction_event=transaction_event,
                 citrine_os_event_headers=citrine_os_event_headers,
             )
         else:
             await self.process_transaction_started_remote(
+                db=db,
                 transaction_event=transaction_event
             )
 
     async def process_transaction_started_scan_and_charge(
         self,
+        db: Session,
         transaction_event: TransactionEventRequest,
         citrine_os_event_headers: CitrineOSeventHeaders,
     ) -> None:
         transactionId = transaction_event.transactionInfo.transactionId
         stationId = citrine_os_event_headers.stationId
 
-        db: Session = next(get_db())
         # If pricing is found to vary by evse, we need to change triggerReasonNoAuthArray to mandate events that know the evse
         # Then add a filter below, EvseModel.ocpp_evse_id == transaction_event.evse.id
         evse = db.query(EvseModel).filter(EvseModel.station_id == stationId).first()
@@ -392,25 +569,20 @@ class CitrineOSIntegration(OcppIntegration):
         return transactionPaymentLink.url
 
     async def process_transaction_started_remote(
-        self, transaction_event: TransactionEventRequest
+        self, db: Session, transaction_event: TransactionEventRequest
     ) -> None:
-        db: Session = next(get_db())
-        db_checkout = (
-            db.query(CheckoutModel)
-            .filter(CheckoutModel.id == transaction_event.transactionInfo.remoteStartId)
-            .first()
+        db_checkout = await self._get_checkout_by_event(
+            db=db,
+            id_tag=transaction_event.idToken.idToken if transaction_event.idToken else None,
+            remote_start_id=transaction_event.transactionInfo.remoteStartId,
+            protocol="ocpp2.0.1",
         )
         if db_checkout is None:
-            info(
-                " [CitrineOS] Checkout not found for transaction start event: %r",
-                transaction_event,
-            )
             return
 
+        db_checkout.ocpp_protocol = "ocpp2.0.1"
         db_checkout.transaction_start_time = transaction_event.timestamp
-        db_checkout.remote_request_transaction_id = (
-            transaction_event.transactionInfo.transactionId
-        )
+
         db_checkout = self.update_checkout_with_meter_values(
             transaction_event=transaction_event, db_checkout=db_checkout
         )
@@ -420,21 +592,18 @@ class CitrineOSIntegration(OcppIntegration):
         return
 
     async def process_transaction_updated(
-        self, transaction_event: TransactionEventRequest
+        self, db: Session, transaction_event: TransactionEventRequest
     ) -> None:
-        db: Session = next(get_db())
-        db_checkout = (
-            db.query(CheckoutModel)
-            .filter(CheckoutModel.id == transaction_event.transactionInfo.remoteStartId)
-            .first()
+        db_checkout = await self._get_checkout_by_event(
+            db=db,
+            id_tag=transaction_event.idToken.idToken if transaction_event.idToken else None,
+            remote_start_id=transaction_event.transactionInfo.remoteStartId,
+            protocol="ocpp2.0.1",
         )
         if db_checkout is None:
-            info(
-                " [CitrineOS] Checkout not found for transaction update event: %r",
-                transaction_event,
-            )
             return
 
+        db_checkout.ocpp_protocol = "ocpp2.0.1"
         db_checkout = self.update_checkout_with_meter_values(
             transaction_event=transaction_event, db_checkout=db_checkout
         )
@@ -444,21 +613,18 @@ class CitrineOSIntegration(OcppIntegration):
         return
 
     async def process_transaction_ended(
-        self, transaction_event: TransactionEventRequest
+        self, db: Session, transaction_event: TransactionEventRequest
     ) -> None:
-        db: Session = next(get_db())
-        db_checkout = (
-            db.query(CheckoutModel)
-            .filter(CheckoutModel.id == transaction_event.transactionInfo.remoteStartId)
-            .first()
+        db_checkout = await self._get_checkout_by_event(
+            db=db,
+            id_tag=transaction_event.idToken.idToken if transaction_event.idToken else None,
+            remote_start_id=transaction_event.transactionInfo.remoteStartId,
+            protocol="ocpp2.0.1",
         )
         if db_checkout is None:
-            info(
-                " [CitrineOS] Checkout not found for transaction end event: %r",
-                transaction_event,
-            )
             return
 
+        db_checkout.ocpp_protocol = "ocpp2.0.1"
         db_checkout = self.update_checkout_with_meter_values(
             transaction_event=transaction_event, db_checkout=db_checkout
         )
@@ -469,6 +635,99 @@ class CitrineOSIntegration(OcppIntegration):
 
         await self.capture_payment_transaction(app=None, checkout_id=db_checkout.id)
 
+        return
+
+    async def process_ocpp16_start_transaction(
+        self,
+        db: Session,
+        start_transaction: Ocpp16StartTransactionRequest,
+        citrine_os_event_headers: CitrineOSeventHeaders,
+        correlation_id: str | None = None,
+    ) -> None:
+        db_checkout = await self._get_checkout_by_event(
+            db=db, id_tag=start_transaction.idTag, protocol="ocpp1.6"
+        )
+        if db_checkout is None:
+            return
+
+        db_checkout.ocpp_protocol = "ocpp1.6"
+        db_checkout.transaction_start_time = start_transaction.timestamp
+        # Initial meter reading for 1.6
+        db_checkout.transaction_last_meter_reading = start_transaction.meterStart / 1000  # Wh to kWh
+        db_checkout.transaction_kwh = 0
+        # Store correlation_id so we can link the response (with transactionId) back to this checkout
+        if correlation_id:
+            db_checkout.correlation_id = correlation_id
+            info(f" [CitrineOS] OCPP1.6 StartTransaction request received, correlation_id={correlation_id}")
+        db.add(db_checkout)
+        db.commit()
+        db.refresh(db_checkout)
+        return
+
+    async def process_ocpp16_start_transaction_response(
+        self,
+        db: Session,
+        start_transaction_response: Ocpp16StartTransactionResponse,
+        citrine_os_event_headers: CitrineOSeventHeaders,
+        correlation_id: str | None = None,
+    ) -> None:
+        """Handles the StartTransaction RESPONSE from the charger.
+        The response contains the transactionId assigned by the charger,
+        which is required to stop the transaction later."""
+        if not correlation_id:
+            warning(" [CitrineOS] StartTransaction response received without correlation_id — cannot link to checkout.")
+            return
+
+        # Find the Checkout via the correlation_id stored during the request
+        db_checkout = (
+            db.query(CheckoutModel)
+            .filter(CheckoutModel.correlation_id == correlation_id)
+            .first()
+        )
+        if db_checkout is None:
+            warning(f" [CitrineOS] No checkout found for correlation_id={correlation_id} in StartTransaction response")
+            return
+
+        # Store the transactionId from the charger's response
+        transaction_id = str(start_transaction_response.transactionId)
+        db_checkout.transaction_id = transaction_id
+        db.add(db_checkout)
+        db.commit()
+        db.refresh(db_checkout)
+        info(f" [CitrineOS] Transaction ID captured: checkout_id={db_checkout.id} transactionId={transaction_id} correlation_id={correlation_id}")
+        return
+
+    async def process_ocpp16_stop_transaction(
+        self,
+        db: Session,
+        stop_transaction: Ocpp16StopTransactionRequest,
+        citrine_os_event_headers: CitrineOSeventHeaders,
+    ) -> None:
+        db_checkout = await self._get_checkout_by_event(
+            db=db,
+            id_tag=stop_transaction.idTag,
+            transaction_id=stop_transaction.transactionId,
+            station_id=citrine_os_event_headers.stationId,
+            protocol="ocpp1.6",
+        )
+        if db_checkout is None:
+            return
+
+        db_checkout.ocpp_protocol = "ocpp1.6"
+        db_checkout.transaction_end_time = stop_transaction.timestamp
+        
+        # Calculate final kWh for 1.6
+        if stop_transaction.meterStop is not None:
+            new_kwh_value = stop_transaction.meterStop / 1000
+            if db_checkout.transaction_last_meter_reading is not None:
+                db_checkout.transaction_kwh = new_kwh_value - db_checkout.transaction_last_meter_reading
+            db_checkout.transaction_last_meter_reading = new_kwh_value
+
+        db.add(db_checkout)
+        db.commit()
+        db.refresh(db_checkout)
+
+        await self.capture_payment_transaction(app=None, checkout_id=db_checkout.id)
         return
 
     def update_checkout_with_meter_values(
@@ -535,6 +794,7 @@ class CitrineOSIntegration(OcppIntegration):
 
     async def process_status_notification(
         self,
+        db: Session,
         status_notification: StatusNotificationRequest,
         citrine_os_event_headers: CitrineOSeventHeaders,
     ) -> None:

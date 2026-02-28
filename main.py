@@ -36,11 +36,14 @@ app.add_middleware(
 """ On startup of the web app also start the event consumer and set stripe api key """
 stripe.api_key = Config.STRIPE_API_KEY
 
-file_integration: FileIntegration = DirectusIntegration(
-    Config.CITRINEOS_DIRECTUS_URL,
-    Config.CITRINEOS_DIRECTUS_LOGIN_EMAIL,
-    Config.CITRINEOS_DIRECTUS_LOGIN_PASSWORD,
-)
+if Config.CITRINEOS_SCAN_AND_CHARGE:
+    file_integration: FileIntegration = DirectusIntegration(
+        Config.CITRINEOS_DIRECTUS_URL,
+        Config.CITRINEOS_DIRECTUS_LOGIN_EMAIL,
+        Config.CITRINEOS_DIRECTUS_LOGIN_PASSWORD,
+    )
+else:
+    file_integration: FileIntegration = FileIntegration()
 ocpp_integration: OcppIntegration = CitrineOSIntegration(file_integration)
 app.ocpp_integration = ocpp_integration
 
@@ -67,7 +70,18 @@ async def health_check():
 
 
 """ Add the frontend web app """
+@app.get("/debug-success/{checkout_id}")
+async def debug_success(checkout_id: int):
+    return {"status": "ok", "checkout_id": checkout_id}
+
+
+@app.get("/debug-cancel")
+async def debug_cancel():
+    return {"status": "cancelled"}
+
+
 templates = Jinja2Templates(directory="frontend/build")
+
 frontend_routes = ["/", "/checkout/{evse_id}", "/charging/{evse_id}/{checkout_id}"]
 
 
