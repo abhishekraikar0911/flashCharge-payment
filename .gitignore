@@ -179,4 +179,7 @@ yarn-error.log*
 
 
 data
-http
+http*.log
+.env*
+*.save
+node_modules/
