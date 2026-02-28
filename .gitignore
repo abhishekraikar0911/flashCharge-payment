@@ -183,3 +183,7 @@ http*.log
 .env*
 *.save
 node_modules/
+.env*
+*.deb
+*.log
+__pycache__/
