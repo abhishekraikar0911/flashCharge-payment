@@ -187,3 +187,6 @@ node_modules/
 *.deb
 *.log
 __pycache__/
+docker-compose.yml
+check-status.sh
+start-payment-ui.sh
